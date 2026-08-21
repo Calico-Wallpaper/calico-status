@@ -4,7 +4,7 @@ One page that answers "is it us, or is it them?" — live status for the service
 production depends on. Built so nobody burns twenty minutes debugging an outage that
 isn't ours.
 
-**Live page:** https://ddopplercalico.github.io/calico-status/
+**Live page:** https://calico-wallpaper.github.io/calico-status/
 
 Auto-refreshes every 5 minutes. Also re-checks when you come back to a tab that's been
 sitting open, so a wall-mounted display never shows stale green.
