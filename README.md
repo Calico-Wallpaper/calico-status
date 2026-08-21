@@ -65,6 +65,12 @@ A `probe` target has to allow cross-origin requests, or it'll read grey instead 
 
 Commit and push — GitHub Pages redeploys in about a minute.
 
+## Slack alerting (built, not live)
+
+`alerts/` holds an n8n workflow that pushes these state changes into Slack —
+one message when something breaks, a threaded reply when it recovers. It is
+**not running yet**, pending sign-off. See `alerts/README.md`.
+
 ## Why not a Claude Artifact
 
 Published artifacts run under a strict content-security policy that blocks every external

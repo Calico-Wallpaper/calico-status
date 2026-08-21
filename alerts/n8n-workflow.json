@@ -1,0 +1,172 @@
+{
+  "name": "Service Status → Slack alerts",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "id": "trigger",
+      "name": "Every 5 minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "buildlist",
+      "name": "Build check list",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/* ══════════════════════════════════════════════════════════════════════\n   Alert decision logic — shared by the n8n workflow and the dry-run test.\n\n   This file is the single source of truth for \"should we ping Slack?\".\n   The n8n \"Evaluate + diff\" Code node contains a copy of everything below;\n   if you change one, change both. dry-run.js exercises this exact file\n   against the live feeds so the logic can be tested without posting.\n   ══════════════════════════════════════════════════════════════════════ */\n\n/* Which services are worth waking people up for when merely DEGRADED (amber).\n   Everything gets alerted on a full outage (red) regardless.\n   Rationale: amber on the AI vendors doesn't stop production, and vendor\n   \"degraded\" often means a business notice (e.g. ShipStation flagging a Royal\n   Mail carrier disruption) rather than a broken service. */\nconst AMBER_MATTERS = new Set([\n  'Dropbox', 'Airtable', 'Salesforce', 'ShipStation', 'WordPress', 'WooCommerce',\n]);\n\n/* An amber must survive this many consecutive checks before it alerts.\n   At a 5-minute schedule, 2 = \"still bad 10 minutes later\". Kills flapping.\n   Red is never delayed. */\nconst AMBER_CONFIRMATIONS = 2;\n\nconst SERVICES = [\n  { name:'Dropbox',     tag:'Files',    kind:'statuspage', host:'status.dropbox.com',     page:'https://status.dropbox.com',    impact:'Job folders, artwork, print files' },\n  { name:'Airtable',    tag:'Ops',      kind:'statuspage', host:'status.airtable.com',    page:'https://status.airtable.com',   impact:'Order board, job tracking, substrate data' },\n  { name:'ShipStation', tag:'Ship',     kind:'statuspage', host:'status.shipstation.com', page:'https://status.shipstation.com',impact:'Labels, tracking, outbound shipments' },\n  { name:'Salesforce',  tag:'CRM',      kind:'salesforce', instance:'USA602',             page:'https://status.salesforce.com/instances/USA602', impact:'Opportunities, POs, invoicing' },\n  { name:'Slack',       tag:'Comms',    kind:'slack',                                     page:'https://slack-status.com',      impact:'Team comms, job threads, alerts' },\n  { name:'Claude',      tag:'AI',       kind:'statuspage', host:'status.claude.com',      page:'https://status.claude.com',     impact:'Claude Code, prepress automation' },\n  { name:'OpenAI',      tag:'AI',       kind:'statuspage', host:'status.openai.com',      page:'https://status.openai.com',      impact:'GPT-backed tools and scripts' },\n  { name:'WordPress',   tag:'Our site', kind:'probe',      url:'https://calicowallpaper.com/wp-json/', page:'https://calicowallpaper.com', impact:'calicowallpaper.com — the public site' },\n  { name:'WooCommerce', tag:'Our shop', kind:'probe',      url:'https://calicowallpaper.com/wp-json/wp/v2/product?per_page=1', page:'https://calicowallpaper.com/shop', impact:'Online store, product pages, checkout' },\n];\n\nconst urlFor = s =>\n  s.kind === 'statuspage' ? `https://${s.host}/api/v2/summary.json` :\n  s.kind === 'slack'      ? 'https://slack-status.com/api/v2.0.0/current' :\n  s.kind === 'salesforce' ? `https://api.status.salesforce.com/v1/instances/${s.instance}/status` :\n  s.url;\n\nconst strip = s => String(s || '').replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').trim();\n\n/* ── Feed adapters: raw payload → {level, label, detail} ───────────────\n   Mirrors index.html exactly. level is one of ok | warn | down | unk.   */\n\nfunction readStatuspage(d){\n  const ind  = d?.status?.indicator || 'none';\n  const inc  = (d?.incidents || []).filter(i => i.status !== 'resolved' && i.status !== 'postmortem');\n  const map  = { none:'ok', minor:'warn', major:'down', critical:'down', maintenance:'warn' };\n  return { level: map[ind] || 'unk',\n           label: d?.status?.description || '',\n           detail: inc.map(i => i.name).join(' · ') };\n}\n\nfunction readSlack(d){\n  const inc = (d?.active_incidents || []).filter(i => i.status !== 'resolved');\n  if(!inc.length) return { level:'ok', label:'All Systems Operational', detail:'' };\n  const outage = inc.some(i => String(i.type||'').toLowerCase() === 'outage');\n  return { level: outage ? 'down' : 'warn',\n           label: outage ? 'Outage' : 'Incident open',\n           detail: inc.map(i => strip(i.title)).join(' · ') };\n}\n\nfunction readSalesforce(d){\n  const raw  = String(d?.status || '').toUpperCase();\n  const live = (d?.Incidents || []).filter(i => String(i.status).toLowerCase() !== 'resolved');\n  let level = 'ok';\n  if(raw.includes('MAJOR') || raw.includes('UNPLANNED')) level = 'down';\n  else if(raw.includes('MINOR') || raw.includes('PERFORMANCE') || raw.includes('DEGRAD') || raw.includes('MAINTENANCE')) level = 'warn';\n  else if(raw && raw !== 'OK') level = 'unk';\n  if(level === 'ok' && live.length) level = 'warn';\n  const pretty = raw === 'OK' ? 'Available'\n    : raw.replace(/_/g,' ').toLowerCase().replace(/\\b\\w/g, c => c.toUpperCase());\n  const detail = live.map(i => {\n    const sev = (i.IncidentImpacts || [])[0]?.severity;\n    return [i.type, sev && `(${sev})`].filter(Boolean).join(' ');\n  }).join(' · ');\n  return { level, label: pretty, detail };\n}\n\n/* statusCode + parsed body → reading. Never throws. */\nfunction evaluate(svc, statusCode, body){\n  if(svc.kind === 'probe'){\n    if(statusCode >= 200 && statusCode < 300) return { level:'ok',   label:'Responding', detail:'' };\n    if(statusCode >= 500)                     return { level:'down', label:'Server error', detail:`HTTP ${statusCode}` };\n    if(statusCode > 0)                        return { level:'warn', label:`HTTP ${statusCode}`, detail:'Answered, but not healthily' };\n    return { level:'unk', label:'No answer', detail:'Could not reach it' };\n  }\n  if(!(statusCode >= 200 && statusCode < 300) || body == null){\n    // The vendor's STATUS PAGE is unreachable — that is not the same as the\n    // vendor being down, and must never alert.\n    return { level:'unk', label:'Status feed unreachable', detail:`HTTP ${statusCode || 0}` };\n  }\n  try{\n    if(svc.kind === 'statuspage') return readStatuspage(body);\n    if(svc.kind === 'slack')      return readSlack(body);\n    if(svc.kind === 'salesforce') return readSalesforce(body);\n  }catch(e){\n    return { level:'unk', label:'Unreadable response', detail:String(e.message || e) };\n  }\n  return { level:'unk', label:'Unknown kind', detail:svc.kind };\n}\n\n/* ── The diff: readings + previous state → alerts + next state ─────────\n\n   state shape, per service name:\n     { alerting: 'warn'|'down'|null,   // what we have already told Slack\n       pending: number,                // consecutive ambers not yet confirmed\n       since: ISO string,              // when the current alerting run began\n       thread: string|null }           // Slack ts of the alert, for threading\n\n   Returns { alerts: [...], state } — alerts is empty on a quiet cycle.     */\n\nfunction diff(readings, prevState, nowISO){\n  const state  = JSON.parse(JSON.stringify(prevState || {}));\n  const alerts = [];\n\n  for(const r of readings){\n    const name = r.service;\n    const st   = state[name] || (state[name] = { alerting:null, pending:0, since:null, thread:null });\n\n    // 'unk' is deliberately inert: hold whatever we last knew, alert nothing.\n    if(r.level === 'unk') continue;\n\n    const isRed    = r.level === 'down';\n    const isAmber  = r.level === 'warn';\n    const amberOK  = isAmber && AMBER_MATTERS.has(name);\n\n    if(isRed || amberOK){\n      const target = isRed ? 'down' : 'warn';\n\n      // Red alerts immediately. Amber has to prove it is not a blip.\n      if(isRed) st.pending = AMBER_CONFIRMATIONS;\n      else      st.pending = Math.min(st.pending + 1, AMBER_CONFIRMATIONS);\n\n      const confirmed = isRed || st.pending >= AMBER_CONFIRMATIONS;\n      if(!confirmed) continue;\n\n      // Already told Slack about this exact level? Stay quiet — no repeat spam\n      // even as the vendor rewrites the incident text.\n      if(st.alerting === target) continue;\n\n      const escalation = st.alerting === 'warn' && target === 'down';\n      if(!escalation) st.since = nowISO;\n      st.alerting = target;\n\n      alerts.push({\n        type: escalation ? 'escalation' : 'new',\n        service:name, level:target, tag:r.tag, impact:r.impact, page:r.page,\n        label:r.label, detail:r.detail, since:st.since, thread:st.thread,\n      });\n\n    } else {\n      // Green, or an amber on a service where amber doesn't matter.\n      st.pending = 0;\n      if(st.alerting){\n        alerts.push({\n          type:'recovery', service:name, level:'ok', tag:r.tag, impact:r.impact,\n          page:r.page, label:r.label || 'Operational', detail:'',\n          since:st.since, thread:st.thread,\n          downtimeMin: st.since ? Math.max(1, Math.round((Date.parse(nowISO) - Date.parse(st.since)) / 60000)) : null,\n        });\n        st.alerting = null; st.since = null; st.thread = null;\n      }\n    }\n  }\n  return { alerts, state };\n}\n\n/* ── Slack message text ───────────────────────────────────────────────── */\nfunction slackText(a){\n  if(a.type === 'recovery'){\n    const dur = a.downtimeMin != null ? ` after ${fmtDur(a.downtimeMin)}` : '';\n    return `:white_check_mark: *${a.service}* is back to normal${dur}.`;\n  }\n  const icon = a.level === 'down' ? ':rotating_light:' : ':warning:';\n  const head = a.type === 'escalation'\n    ? `${icon} *${a.service}* has got worse — now a full outage`\n    : a.level === 'down'\n      ? `${icon} *${a.service}* is down`\n      : `${icon} *${a.service}* is degraded`;\n  const lines = [head];\n  if(a.label)  lines.push(`> ${a.label}`);\n  if(a.detail) lines.push(`> ${a.detail}`);\n  lines.push(`*Affects:* ${a.impact}`);\n  lines.push(`<${a.page}|Vendor status page>  ·  <https://calico-wallpaper.github.io/calico-status/|Our board>`);\n  lines.push('_Not our systems — no need to go hunting._');\n  return lines.join('\\n');\n}\n\nconst fmtDur = m => m < 60 ? `${m} min` : `${Math.floor(m/60)}h ${m%60}m`;\n\n\n/* ── n8n driver ─────────────────────────────────────────────────────── */\n// One item per service, carrying the URL for the HTTP node to call.\nreturn SERVICES.map(s => ({ json: { service: s.name, url: urlFor(s) } }));\n"
+      }
+    },
+    {
+      "id": "fetch",
+      "name": "Fetch status feeds",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        440,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "url": "={{ $json.url }}",
+        "options": {
+          "timeout": 10000,
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "evaluate",
+      "name": "Evaluate + diff",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/* ══════════════════════════════════════════════════════════════════════\n   Alert decision logic — shared by the n8n workflow and the dry-run test.\n\n   This file is the single source of truth for \"should we ping Slack?\".\n   The n8n \"Evaluate + diff\" Code node contains a copy of everything below;\n   if you change one, change both. dry-run.js exercises this exact file\n   against the live feeds so the logic can be tested without posting.\n   ══════════════════════════════════════════════════════════════════════ */\n\n/* Which services are worth waking people up for when merely DEGRADED (amber).\n   Everything gets alerted on a full outage (red) regardless.\n   Rationale: amber on the AI vendors doesn't stop production, and vendor\n   \"degraded\" often means a business notice (e.g. ShipStation flagging a Royal\n   Mail carrier disruption) rather than a broken service. */\nconst AMBER_MATTERS = new Set([\n  'Dropbox', 'Airtable', 'Salesforce', 'ShipStation', 'WordPress', 'WooCommerce',\n]);\n\n/* An amber must survive this many consecutive checks before it alerts.\n   At a 5-minute schedule, 2 = \"still bad 10 minutes later\". Kills flapping.\n   Red is never delayed. */\nconst AMBER_CONFIRMATIONS = 2;\n\nconst SERVICES = [\n  { name:'Dropbox',     tag:'Files',    kind:'statuspage', host:'status.dropbox.com',     page:'https://status.dropbox.com',    impact:'Job folders, artwork, print files' },\n  { name:'Airtable',    tag:'Ops',      kind:'statuspage', host:'status.airtable.com',    page:'https://status.airtable.com',   impact:'Order board, job tracking, substrate data' },\n  { name:'ShipStation', tag:'Ship',     kind:'statuspage', host:'status.shipstation.com', page:'https://status.shipstation.com',impact:'Labels, tracking, outbound shipments' },\n  { name:'Salesforce',  tag:'CRM',      kind:'salesforce', instance:'USA602',             page:'https://status.salesforce.com/instances/USA602', impact:'Opportunities, POs, invoicing' },\n  { name:'Slack',       tag:'Comms',    kind:'slack',                                     page:'https://slack-status.com',      impact:'Team comms, job threads, alerts' },\n  { name:'Claude',      tag:'AI',       kind:'statuspage', host:'status.claude.com',      page:'https://status.claude.com',     impact:'Claude Code, prepress automation' },\n  { name:'OpenAI',      tag:'AI',       kind:'statuspage', host:'status.openai.com',      page:'https://status.openai.com',      impact:'GPT-backed tools and scripts' },\n  { name:'WordPress',   tag:'Our site', kind:'probe',      url:'https://calicowallpaper.com/wp-json/', page:'https://calicowallpaper.com', impact:'calicowallpaper.com — the public site' },\n  { name:'WooCommerce', tag:'Our shop', kind:'probe',      url:'https://calicowallpaper.com/wp-json/wp/v2/product?per_page=1', page:'https://calicowallpaper.com/shop', impact:'Online store, product pages, checkout' },\n];\n\nconst urlFor = s =>\n  s.kind === 'statuspage' ? `https://${s.host}/api/v2/summary.json` :\n  s.kind === 'slack'      ? 'https://slack-status.com/api/v2.0.0/current' :\n  s.kind === 'salesforce' ? `https://api.status.salesforce.com/v1/instances/${s.instance}/status` :\n  s.url;\n\nconst strip = s => String(s || '').replace(/<[^>]*>/g, ' ').replace(/\\s+/g, ' ').trim();\n\n/* ── Feed adapters: raw payload → {level, label, detail} ───────────────\n   Mirrors index.html exactly. level is one of ok | warn | down | unk.   */\n\nfunction readStatuspage(d){\n  const ind  = d?.status?.indicator || 'none';\n  const inc  = (d?.incidents || []).filter(i => i.status !== 'resolved' && i.status !== 'postmortem');\n  const map  = { none:'ok', minor:'warn', major:'down', critical:'down', maintenance:'warn' };\n  return { level: map[ind] || 'unk',\n           label: d?.status?.description || '',\n           detail: inc.map(i => i.name).join(' · ') };\n}\n\nfunction readSlack(d){\n  const inc = (d?.active_incidents || []).filter(i => i.status !== 'resolved');\n  if(!inc.length) return { level:'ok', label:'All Systems Operational', detail:'' };\n  const outage = inc.some(i => String(i.type||'').toLowerCase() === 'outage');\n  return { level: outage ? 'down' : 'warn',\n           label: outage ? 'Outage' : 'Incident open',\n           detail: inc.map(i => strip(i.title)).join(' · ') };\n}\n\nfunction readSalesforce(d){\n  const raw  = String(d?.status || '').toUpperCase();\n  const live = (d?.Incidents || []).filter(i => String(i.status).toLowerCase() !== 'resolved');\n  let level = 'ok';\n  if(raw.includes('MAJOR') || raw.includes('UNPLANNED')) level = 'down';\n  else if(raw.includes('MINOR') || raw.includes('PERFORMANCE') || raw.includes('DEGRAD') || raw.includes('MAINTENANCE')) level = 'warn';\n  else if(raw && raw !== 'OK') level = 'unk';\n  if(level === 'ok' && live.length) level = 'warn';\n  const pretty = raw === 'OK' ? 'Available'\n    : raw.replace(/_/g,' ').toLowerCase().replace(/\\b\\w/g, c => c.toUpperCase());\n  const detail = live.map(i => {\n    const sev = (i.IncidentImpacts || [])[0]?.severity;\n    return [i.type, sev && `(${sev})`].filter(Boolean).join(' ');\n  }).join(' · ');\n  return { level, label: pretty, detail };\n}\n\n/* statusCode + parsed body → reading. Never throws. */\nfunction evaluate(svc, statusCode, body){\n  if(svc.kind === 'probe'){\n    if(statusCode >= 200 && statusCode < 300) return { level:'ok',   label:'Responding', detail:'' };\n    if(statusCode >= 500)                     return { level:'down', label:'Server error', detail:`HTTP ${statusCode}` };\n    if(statusCode > 0)                        return { level:'warn', label:`HTTP ${statusCode}`, detail:'Answered, but not healthily' };\n    return { level:'unk', label:'No answer', detail:'Could not reach it' };\n  }\n  if(!(statusCode >= 200 && statusCode < 300) || body == null){\n    // The vendor's STATUS PAGE is unreachable — that is not the same as the\n    // vendor being down, and must never alert.\n    return { level:'unk', label:'Status feed unreachable', detail:`HTTP ${statusCode || 0}` };\n  }\n  try{\n    if(svc.kind === 'statuspage') return readStatuspage(body);\n    if(svc.kind === 'slack')      return readSlack(body);\n    if(svc.kind === 'salesforce') return readSalesforce(body);\n  }catch(e){\n    return { level:'unk', label:'Unreadable response', detail:String(e.message || e) };\n  }\n  return { level:'unk', label:'Unknown kind', detail:svc.kind };\n}\n\n/* ── The diff: readings + previous state → alerts + next state ─────────\n\n   state shape, per service name:\n     { alerting: 'warn'|'down'|null,   // what we have already told Slack\n       pending: number,                // consecutive ambers not yet confirmed\n       since: ISO string,              // when the current alerting run began\n       thread: string|null }           // Slack ts of the alert, for threading\n\n   Returns { alerts: [...], state } — alerts is empty on a quiet cycle.     */\n\nfunction diff(readings, prevState, nowISO){\n  const state  = JSON.parse(JSON.stringify(prevState || {}));\n  const alerts = [];\n\n  for(const r of readings){\n    const name = r.service;\n    const st   = state[name] || (state[name] = { alerting:null, pending:0, since:null, thread:null });\n\n    // 'unk' is deliberately inert: hold whatever we last knew, alert nothing.\n    if(r.level === 'unk') continue;\n\n    const isRed    = r.level === 'down';\n    const isAmber  = r.level === 'warn';\n    const amberOK  = isAmber && AMBER_MATTERS.has(name);\n\n    if(isRed || amberOK){\n      const target = isRed ? 'down' : 'warn';\n\n      // Red alerts immediately. Amber has to prove it is not a blip.\n      if(isRed) st.pending = AMBER_CONFIRMATIONS;\n      else      st.pending = Math.min(st.pending + 1, AMBER_CONFIRMATIONS);\n\n      const confirmed = isRed || st.pending >= AMBER_CONFIRMATIONS;\n      if(!confirmed) continue;\n\n      // Already told Slack about this exact level? Stay quiet — no repeat spam\n      // even as the vendor rewrites the incident text.\n      if(st.alerting === target) continue;\n\n      const escalation = st.alerting === 'warn' && target === 'down';\n      if(!escalation) st.since = nowISO;\n      st.alerting = target;\n\n      alerts.push({\n        type: escalation ? 'escalation' : 'new',\n        service:name, level:target, tag:r.tag, impact:r.impact, page:r.page,\n        label:r.label, detail:r.detail, since:st.since, thread:st.thread,\n      });\n\n    } else {\n      // Green, or an amber on a service where amber doesn't matter.\n      st.pending = 0;\n      if(st.alerting){\n        alerts.push({\n          type:'recovery', service:name, level:'ok', tag:r.tag, impact:r.impact,\n          page:r.page, label:r.label || 'Operational', detail:'',\n          since:st.since, thread:st.thread,\n          downtimeMin: st.since ? Math.max(1, Math.round((Date.parse(nowISO) - Date.parse(st.since)) / 60000)) : null,\n        });\n        st.alerting = null; st.since = null; st.thread = null;\n      }\n    }\n  }\n  return { alerts, state };\n}\n\n/* ── Slack message text ───────────────────────────────────────────────── */\nfunction slackText(a){\n  if(a.type === 'recovery'){\n    const dur = a.downtimeMin != null ? ` after ${fmtDur(a.downtimeMin)}` : '';\n    return `:white_check_mark: *${a.service}* is back to normal${dur}.`;\n  }\n  const icon = a.level === 'down' ? ':rotating_light:' : ':warning:';\n  const head = a.type === 'escalation'\n    ? `${icon} *${a.service}* has got worse — now a full outage`\n    : a.level === 'down'\n      ? `${icon} *${a.service}* is down`\n      : `${icon} *${a.service}* is degraded`;\n  const lines = [head];\n  if(a.label)  lines.push(`> ${a.label}`);\n  if(a.detail) lines.push(`> ${a.detail}`);\n  lines.push(`*Affects:* ${a.impact}`);\n  lines.push(`<${a.page}|Vendor status page>  ·  <https://calico-wallpaper.github.io/calico-status/|Our board>`);\n  lines.push('_Not our systems — no need to go hunting._');\n  return lines.join('\\n');\n}\n\nconst fmtDur = m => m < 60 ? `${m} min` : `${Math.floor(m/60)}h ${m%60}m`;\n\n\n/* ── n8n driver ─────────────────────────────────────────────────────── */\nconst CHANNEL = \"C07MZHCA9R6\";   // #technology\n\nconst responses = $input.all();\nconst metas     = $('Build check list').all().map(i => i.json);\nconst nowISO    = new Date().toISOString();\n\n// The HTTP node preserves input order, so index pairs response → service.\nconst readings = responses.map((it, idx) => {\n  const meta = metas[idx] || {};\n  const svc  = SERVICES.find(s => s.name === meta.service);\n  if (!svc) return null;\n\n  const statusCode = Number(it.json?.statusCode) || 0;\n  let body = it.json?.body;\n  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = null; } }\n\n  return { service: svc.name, tag: svc.tag, impact: svc.impact, page: svc.page,\n           ...evaluate(svc, statusCode, body) };\n}).filter(Boolean);\n\n// Static data persists between PRODUCTION executions. Note: n8n does NOT\n// persist it for manual test runs, so a manual run always behaves like a\n// cold start. That is expected, not a bug.\nconst store = $getWorkflowStaticData('global');\nconst prev  = store.serviceState || {};\n\nconst { alerts, state } = diff(readings, prev, nowISO);\n\nstore.serviceState = state;\nstore.lastRun      = nowISO;\nstore.lastReadings = readings.map(r => r.service + '=' + r.level).join(',');\n\n// Zero alerts on a quiet cycle → nothing downstream runs → no Slack post.\nreturn alerts.map(a => ({\n  json: {\n    ...a,\n    slackBody: {\n      channel: CHANNEL,\n      text: slackText(a),\n      unfurl_links: false,\n      unfurl_media: false,\n      // Escalations and recoveries thread under the original alert.\n      ...(a.thread ? { thread_ts: a.thread } : {}),\n    },\n  },\n}));\n"
+      }
+    },
+    {
+      "id": "post",
+      "name": "Post to #technology",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        880,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "slackApi",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json; charset=utf-8",
+        "body": "={{ JSON.stringify($json.slackBody) }}",
+        "options": {}
+      }
+    },
+    {
+      "id": "savets",
+      "name": "Save thread id",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "/* Remember each alert's Slack message id so the recovery can reply in-thread. */\nconst store = $getWorkflowStaticData('global');\nconst state = store.serviceState || {};\nconst posts = $('Evaluate + diff').all().map(i => i.json);\n\n$input.all().forEach((it, idx) => {\n  const post = posts[idx];\n  const ts   = it.json?.ts;\n  if (!post || !ts || !it.json?.ok) return;\n  // Only opening alerts own the thread; a recovery closes it out.\n  if (post.type !== 'recovery' && state[post.service]) state[post.service].thread = ts;\n});\n\nstore.serviceState = state;\nreturn $input.all();\n"
+      }
+    }
+  ],
+  "connections": {
+    "Every 5 minutes": {
+      "main": [
+        [
+          {
+            "node": "Build check list",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build check list": {
+      "main": [
+        [
+          {
+            "node": "Fetch status feeds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch status feeds": {
+      "main": [
+        [
+          {
+            "node": "Evaluate + diff",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate + diff": {
+      "main": [
+        [
+          {
+            "node": "Post to #technology",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Post to #technology": {
+      "main": [
+        [
+          {
+            "node": "Save thread id",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
