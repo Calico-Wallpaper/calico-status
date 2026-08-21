@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Calico Service Status</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='38' fill='%230f9960'/%3E%3C/svg%3E">
+<meta name="description" content="Live status of the services Calico production depends on.">
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#ffffff; --panel-2:#f0f2f5; --line:#dfe3e9;
+    --ink:#14181f; --ink-2:#5b6474; --ink-3:#8a93a3;
+    --ok:#0f9960; --ok-bg:#e7f6ee;
+    --warn:#b06f00; --warn-bg:#fdf3e0;
+    --down:#c62828; --down-bg:#fdeaea;
+    --unk:#6b7280; --unk-bg:#eef0f3;
+    --shadow:0 1px 2px rgba(16,24,40,.06),0 4px 12px rgba(16,24,40,.05);
+    --radius:14px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0e1116; --panel:#171b22; --panel-2:#1e232c; --line:#2a313c;
+      --ink:#eef1f6; --ink-2:#a3adbd; --ink-3:#77818f;
+      --ok:#3ddc97; --ok-bg:#12291f;
+      --warn:#ffc247; --warn-bg:#2e2312;
+      --down:#ff6b6b; --down-bg:#2f1618;
+      --unk:#9aa4b2; --unk-bg:#1f242c;
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px rgba(0,0,0,.3);
+    }
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--ink);
+    font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased; padding:24px 20px 60px;
+  }
+  .wrap{max-width:1120px;margin:0 auto}
+
+  /* ── Verdict banner ───────────────────────────────── */
+  .verdict{
+    border-radius:var(--radius); padding:22px 24px; margin-bottom:8px;
+    display:flex; align-items:center; gap:18px; flex-wrap:wrap;
+    border:1px solid var(--line); background:var(--panel); box-shadow:var(--shadow);
+  }
+  .verdict.is-ok{background:var(--ok-bg); border-color:color-mix(in srgb,var(--ok) 35%,transparent)}
+  .verdict.is-warn{background:var(--warn-bg); border-color:color-mix(in srgb,var(--warn) 40%,transparent)}
+  .verdict.is-down{background:var(--down-bg); border-color:color-mix(in srgb,var(--down) 40%,transparent)}
+  .verdict-mark{font-size:38px; line-height:1; flex:none}
+  .verdict-text{flex:1 1 280px; min-width:0}
+  .verdict-head{font-size:clamp(20px,3.4vw,28px); font-weight:700; letter-spacing:-.02em}
+  .verdict-sub{color:var(--ink-2); font-size:15px; margin-top:2px}
+  .verdict.is-ok .verdict-head,.verdict.is-ok .verdict-mark{color:var(--ok)}
+  .verdict.is-warn .verdict-head,.verdict.is-warn .verdict-mark{color:var(--warn)}
+  .verdict.is-down .verdict-head,.verdict.is-down .verdict-mark{color:var(--down)}
+
+  .meta{
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    color:var(--ink-3); font-size:13px; padding:6px 4px 18px;
+  }
+  .meta .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);flex:none}
+  .meta .dot.stale{background:var(--warn)}
+  button.refresh{
+    font:inherit; font-size:13px; font-weight:600; cursor:pointer;
+    background:var(--panel); color:var(--ink); border:1px solid var(--line);
+    border-radius:8px; padding:6px 12px;
+  }
+  button.refresh:hover{background:var(--panel-2)}
+  button.refresh:disabled{opacity:.5;cursor:default}
+
+  /* ── Cards ────────────────────────────────────────── */
+  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:14px; align-items:stretch}
+  .card{display:flex; flex-direction:column}
+  .card .impact{margin-top:auto}
+  .card{
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+    padding:16px 18px; box-shadow:var(--shadow); position:relative; overflow:hidden;
+  }
+  .card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--unk)}
+  .card.lv-ok::before{background:var(--ok)}
+  .card.lv-warn::before{background:var(--warn)}
+  .card.lv-down::before{background:var(--down)}
+  .card.lv-down{background:var(--down-bg)}
+  .card.lv-warn{background:var(--warn-bg)}
+
+  .card-top{display:flex; align-items:baseline; gap:10px}
+  .name{font-size:17px; font-weight:700; letter-spacing:-.01em}
+  .tag{
+    font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.05em;
+    color:var(--ink-3); background:var(--panel-2); border:1px solid var(--line);
+    padding:2px 7px; border-radius:99px; margin-left:auto; flex:none;
+  }
+  .state{display:flex; align-items:center; gap:8px; margin-top:10px}
+  .glyph{font-size:15px; line-height:1; flex:none}
+  .state-label{font-weight:650; font-size:15px}
+  .lv-ok .state-label,.lv-ok .glyph{color:var(--ok)}
+  .lv-warn .state-label,.lv-warn .glyph{color:var(--warn)}
+  .lv-down .state-label,.lv-down .glyph{color:var(--down)}
+  .lv-unk .state-label,.lv-unk .glyph{color:var(--unk)}
+  .lv-load .state-label,.lv-load .glyph{color:var(--ink-3)}
+
+  .detail{
+    margin-top:8px; font-size:14px; color:var(--ink-2);
+    display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden;
+  }
+  .impact{
+    margin-top:12px; padding-top:10px; border-top:1px dashed var(--line);
+    font-size:12.5px; color:var(--ink-3);
+  }
+  .impact b{color:var(--ink-2); font-weight:600}
+  .card a.more{
+    display:inline-block; margin-top:10px; font-size:12.5px; font-weight:600;
+    color:var(--ink-2); text-decoration:none; border-bottom:1px solid var(--line);
+  }
+  .card a.more:hover{color:var(--ink); border-color:var(--ink-3)}
+  .stale-flag{font-size:11px;color:var(--warn);font-weight:600;margin-top:8px}
+
+  footer{margin-top:26px; color:var(--ink-3); font-size:12.5px; text-align:center; line-height:1.7}
+  footer code{background:var(--panel-2);padding:1px 5px;border-radius:4px;font-size:12px}
+  @media (prefers-reduced-motion:no-preference){
+    .card{transition:background .3s ease}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="verdict" id="verdict">
+    <div class="verdict-mark" id="v-mark">⋯</div>
+    <div class="verdict-text">
+      <div class="verdict-head" id="v-head">Checking services…</div>
+      <div class="verdict-sub" id="v-sub">Polling nine status feeds.</div>
+    </div>
+  </div>
+
+  <div class="meta">
+    <span class="dot" id="live-dot"></span>
+    <span id="last-checked">—</span>
+    <span>·</span>
+    <span id="next-check">next check in —</span>
+    <button class="refresh" id="btn">Check now</button>
+  </div>
+
+  <div class="grid" id="grid"></div>
+
+  <footer>
+    Green means the vendor says it's fine — it is not a guarantee. If something looks broken and its card is green, the problem is probably ours.<br>
+    Auto-refreshes every 5 minutes. Add a service by editing the <code>SERVICES</code> list at the top of this page's source.
+  </footer>
+</div>
+
+<script>
+/* ══════════════════════════════════════════════════════════════
+   SERVICES — to add one, copy a line and fill it in.
+
+   kind: 'statuspage'  → any Atlassian-Statuspage site. Set host to the
+                         status domain (we call https://HOST/api/v2/summary.json).
+         'slack'       → Slack's own feed.
+         'salesforce'  → Salesforce instance feed. instance = our org's
+                         instance key (USA602 — from Organization.InstanceName).
+         'probe'       → no vendor status page; we just call a URL on the
+                         thing itself and see if it answers.
+
+   impact: plain-English note on what breaks here when this is down.
+   ══════════════════════════════════════════════════════════════ */
+const SERVICES = [
+  { name:'Dropbox',     tag:'Files',   kind:'statuspage', host:'status.dropbox.com',    page:'https://status.dropbox.com',    impact:'Job folders, artwork, print files' },
+  { name:'Airtable',    tag:'Ops',     kind:'statuspage', host:'status.airtable.com',   page:'https://status.airtable.com',   impact:'Order board, job tracking, substrate data' },
+  { name:'ShipStation', tag:'Ship',    kind:'statuspage', host:'status.shipstation.com',page:'https://status.shipstation.com',impact:'Labels, tracking, outbound shipments' },
+  { name:'Salesforce',  tag:'CRM',     kind:'salesforce', instance:'USA602',            page:'https://status.salesforce.com/instances/USA602',  impact:'Opportunities, POs, invoicing — our instance only' },
+  { name:'Slack',       tag:'Comms',   kind:'slack',                                    page:'https://slack-status.com',      impact:'Team comms, job threads, alerts' },
+  { name:'Claude',      tag:'AI',      kind:'statuspage', host:'status.claude.com',     page:'https://status.claude.com',     impact:'Claude Code, prepress automation, this page' },
+  { name:'OpenAI',      tag:'AI',      kind:'statuspage', host:'status.openai.com',     page:'https://status.openai.com',     impact:'GPT-backed tools and scripts' },
+  { name:'WordPress',   tag:'Our site',kind:'probe',      url:'https://calicowallpaper.com/wp-json/',                 page:'https://calicowallpaper.com', impact:'calicowallpaper.com — the public site' },
+  { name:'WooCommerce', tag:'Our shop',kind:'probe',      url:'https://calicowallpaper.com/wp-json/wp/v2/product?per_page=1', page:'https://calicowallpaper.com/shop', impact:'Online store, product pages, checkout' },
+];
+
+const REFRESH_MS  = 5 * 60 * 1000;   // auto-refresh interval
+const TIMEOUT_MS  = 10 * 1000;       // per-request give-up
+const STALE_MS    = 12 * 60 * 1000;  // data older than this is called out
+
+/* ── Severity model ─────────────────────────────────── */
+const LV = {
+  down: { rank:4, cls:'lv-down', glyph:'■', word:'Down' },
+  warn: { rank:3, cls:'lv-warn', glyph:'▲', word:'Issues' },
+  unk:  { rank:2, cls:'lv-unk',  glyph:'?', word:'Unknown' },
+  ok:   { rank:1, cls:'lv-ok',   glyph:'●', word:'Operational' },
+  load: { rank:0, cls:'lv-load', glyph:'⋯', word:'Checking…' },
+};
+
+const state = new Map(SERVICES.map(s => [s.name, { svc:s, level:'load', label:null, detail:'', at:null }]));
+
+/* ── Fetch helper: timeout + no caching ─────────────── */
+async function getJSON(url){
+  const ctl = new AbortController();
+  const kill = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+  try{
+    const bust = url.includes('?') ? '&' : '?';
+    const res = await fetch(url + bust + '_=' + Date.now(), { signal:ctl.signal, cache:'no-store' });
+    if(!res.ok) return { httpError:res.status };
+    return { data: await res.json() };
+  }catch(e){
+    return { netError: e.name === 'AbortError' ? 'timed out' : 'unreachable' };
+  }finally{
+    clearTimeout(kill);
+  }
+}
+
+const strip = s => String(s||'').replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim();
+
+/* ── Adapters: raw feed → {level, label, detail} ─────── */
+
+// Atlassian Statuspage: indicator is none|minor|major|critical|maintenance
+function readStatuspage(d){
+  const ind  = d?.status?.indicator || 'none';
+  const desc = d?.status?.description || '';
+  const inc  = (d?.incidents || []).filter(i => i.status !== 'resolved' && i.status !== 'postmortem');
+  const map  = { none:'ok', minor:'warn', major:'down', critical:'down', maintenance:'warn' };
+  return {
+    level: map[ind] || 'unk',
+    label: desc || null,
+    detail: inc.map(i => i.name).join(' · '),
+  };
+}
+
+// Slack: status is 'ok' | 'active', with active_incidents[]
+function readSlack(d){
+  const inc = (d?.active_incidents || []).filter(i => i.status !== 'resolved');
+  if(!inc.length) return { level:'ok', label:'All Systems Operational', detail:'' };
+  const outage = inc.some(i => (i.type||'').toLowerCase() === 'outage');
+  return {
+    level: outage ? 'down' : 'warn',
+    label: outage ? 'Outage' : 'Incident open',
+    detail: inc.map(i => strip(i.title)).join(' · '),
+  };
+}
+
+// Salesforce instance feed. status: OK | MINOR_INCIDENT_CORE | MAJOR_INCIDENT_CORE | MAINTENANCE…
+// Incidents[] includes resolved history — filter it down to what's still live.
+function readSalesforce(d){
+  const raw  = String(d?.status || '').toUpperCase();
+  const live = (d?.Incidents || []).filter(i => String(i.status).toLowerCase() !== 'resolved');
+  let level = 'ok';
+  if(raw.includes('MAJOR') || raw.includes('UNPLANNED')) level = 'down';
+  else if(raw.includes('MINOR') || raw.includes('PERFORMANCE') || raw.includes('DEGRAD')) level = 'warn';
+  else if(raw.includes('MAINTENANCE')) level = 'warn';
+  else if(raw !== 'OK' && raw !== '') level = 'unk';
+  if(level === 'ok' && live.length) level = 'warn';
+
+  const pretty = raw === 'OK' ? 'Available' : raw.replace(/_/g,' ').toLowerCase()
+                  .replace(/\b\w/g, c => c.toUpperCase());
+  const detail = live.map(i => {
+    const sev = (i.IncidentImpacts||[])[0]?.severity;
+    return [i.type, sev && `(${sev})`].filter(Boolean).join(' ');
+  }).join(' · ');
+  return { level, label:pretty, detail: detail || (d?.releaseVersion ? 'Instance ' + d.key : '') };
+}
+
+/* ── Check one service ──────────────────────────────── */
+async function check(svc){
+  if(svc.kind === 'probe'){
+    const ctl = new AbortController();
+    const kill = setTimeout(() => ctl.abort(), TIMEOUT_MS);
+    try{
+      const bust = svc.url.includes('?') ? '&' : '?';
+      const res = await fetch(svc.url + bust + '_=' + Date.now(), { signal:ctl.signal, cache:'no-store' });
+      if(res.ok)          return { level:'ok',   label:'Responding', detail:'' };
+      if(res.status >= 500) return { level:'down', label:'Server error', detail:'Returned HTTP ' + res.status };
+      return { level:'warn', label:'HTTP ' + res.status, detail:'Answered, but not with a healthy response' };
+    }catch(e){
+      // Could be genuinely down, or could be our own network / a blocked request.
+      // Never paint this red on a guess.
+      return { level:'unk', label:'No answer', detail:'Could not reach it from this browser — open the site to confirm' };
+    }finally{ clearTimeout(kill); }
+  }
+
+  const url =
+    svc.kind === 'statuspage' ? `https://${svc.host}/api/v2/summary.json` :
+    svc.kind === 'slack'      ? 'https://slack-status.com/api/v2.0.0/current' :
+    svc.kind === 'salesforce' ? `https://api.status.salesforce.com/v1/instances/${svc.instance}/status` : null;
+
+  if(!url) return { level:'unk', label:'Not configured', detail:'Unknown kind: ' + svc.kind };
+
+  const r = await getJSON(url);
+  if(r.netError)   return { level:'unk', label:'Status feed ' + r.netError, detail:'Check the vendor page directly' };
+  if(r.httpError)  return { level:'unk', label:'Status feed error ' + r.httpError, detail:'Check the vendor page directly' };
+
+  try{
+    if(svc.kind === 'statuspage') return readStatuspage(r.data);
+    if(svc.kind === 'slack')      return readSlack(r.data);
+    if(svc.kind === 'salesforce') return readSalesforce(r.data);
+  }catch(e){
+    return { level:'unk', label:'Unreadable response', detail:String(e.message||e) };
+  }
+}
+
+/* ── Rendering ──────────────────────────────────────── */
+const el = id => document.getElementById(id);
+const fmtTime = d => d.toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
+
+function render(){
+  const rows = [...state.values()].sort((a,b) =>
+    (LV[b.level].rank - LV[a.level].rank) || a.svc.name.localeCompare(b.svc.name));
+
+  el('grid').innerHTML = rows.map(r => {
+    const lv = LV[r.level];
+    const stale = r.at && (Date.now() - r.at > STALE_MS);
+    return `
+      <div class="card ${lv.cls}">
+        <div class="card-top">
+          <span class="name">${r.svc.name}</span>
+          <span class="tag">${r.svc.tag}</span>
+        </div>
+        <div class="state">
+          <span class="glyph">${lv.glyph}</span>
+          <span class="state-label">${r.label || lv.word}</span>
+        </div>
+        ${r.detail ? `<div class="detail">${r.detail}</div>` : ''}
+        ${stale ? `<div class="stale-flag">Last confirmed ${fmtTime(new Date(r.at))} — may be out of date</div>` : ''}
+        <div class="impact"><b>Affects:</b> ${r.svc.impact}</div>
+        <a class="more" href="${r.svc.page}" target="_blank" rel="noopener">Full status page →</a>
+      </div>`;
+  }).join('');
+
+  // Overall verdict
+  const bad  = rows.filter(r => r.level === 'down');
+  const meh  = rows.filter(r => r.level === 'warn');
+  const unk  = rows.filter(r => r.level === 'unk');
+  const busy = rows.some(r => r.level === 'load');
+
+  const v = el('verdict');
+  v.className = 'verdict';
+  let mark, head, sub;
+
+  if(busy && !bad.length && !meh.length){
+    mark = '⋯'; head = 'Checking services…'; sub = 'Polling status feeds.';
+  } else if(bad.length){
+    v.classList.add('is-down'); mark = '■';
+    head = `${bad.length} service${bad.length>1?'s':''} down`;
+    sub  = bad.map(r => r.svc.name).join(', ') + (meh.length ? ` · also degraded: ${meh.map(r=>r.svc.name).join(', ')}` : '');
+  } else if(meh.length){
+    v.classList.add('is-warn'); mark = '▲';
+    head = `${meh.length} service${meh.length>1?'s':''} having issues`;
+    sub  = meh.map(r => r.svc.name).join(', ') + ' — nothing fully down.';
+  } else if(unk.length === rows.length){
+    v.classList.add('is-warn'); mark = '?';
+    head = 'Can’t reach anything';
+    sub  = 'Every check failed — that usually means this machine’s connection, not nine outages.';
+  } else {
+    v.classList.add('is-ok'); mark = '●';
+    head = 'All services operational';
+    sub  = unk.length
+      ? `${unk.length} couldn’t be confirmed: ${unk.map(r=>r.svc.name).join(', ')}. Everything else is green.`
+      : 'Nothing is down. If something’s broken, it’s on our end.';
+  }
+  el('v-mark').textContent = mark;
+  el('v-head').textContent = head;
+  el('v-sub').textContent  = sub;
+}
+
+/* ── Refresh cycle ──────────────────────────────────── */
+let lastRun = null, nextRun = null, running = false;
+
+async function runAll(){
+  if(running) return;
+  running = true;
+  el('btn').disabled = true;
+
+  await Promise.all(SERVICES.map(async svc => {
+    const prev = state.get(svc.name);
+    const res  = await check(svc);
+    // Keep the last good reading visible if a refresh fails outright.
+    if(res.level === 'unk' && prev && prev.level !== 'unk' && prev.level !== 'load'){
+      state.set(svc.name, { ...prev, detail: prev.detail });
+    } else {
+      state.set(svc.name, { svc, ...res, at: Date.now() });
+    }
+    render();
+  }));
+
+  lastRun = Date.now();
+  nextRun = lastRun + REFRESH_MS;
+  running = false;
+  el('btn').disabled = false;
+  render();
+  tick();
+}
+
+function tick(){
+  if(lastRun){
+    el('last-checked').textContent = 'Checked ' + fmtTime(new Date(lastRun));
+    el('live-dot').classList.toggle('stale', Date.now() - lastRun > STALE_MS);
+  }
+  if(nextRun){
+    const s = Math.max(0, Math.round((nextRun - Date.now())/1000));
+    const m = Math.floor(s/60);
+    el('next-check').textContent = 'next check in ' + (m >= 1 ? m + ' min' : s + 's');
+  }
+}
+
+el('btn').addEventListener('click', runAll);
+setInterval(tick, 1000);
+setInterval(() => { if(Date.now() >= (nextRun || 0)) runAll(); }, 15000);
+// Coming back to a long-open tab shouldn't show stale data.
+document.addEventListener('visibilitychange', () => {
+  if(!document.hidden && lastRun && Date.now() - lastRun > 60000) runAll();
+});
+runAll();
+</script>
+</body>
+</html>
